@@ -11,6 +11,9 @@ DB_PASS="dbpassword"                               # Only used if CONFIGURE_DB=t
 DOMAIN="example.com"                               # Domain name for the app
 APP_USER="${SUDO_USER:-$USER}"                     # User to run the app
 PROJECT_DIR="/home/$APP_USER/$PROJECT_NAME"        # Project directory path
+MAX_UPLOAD_SIZE="100M"                             # Max upload size (100MB)
+TIMEOUTS="600"                                     # Timeouts in seconds (10 minutes)
+MEDIA_ROOT="$PROJECT_DIR/media"                    # Media files directory
 
 # 1. Clone the Django project
 if [ ! -d "$PROJECT_DIR" ]; then
@@ -21,14 +24,12 @@ fi
 
 # 2. Conditionally install and configure PostgreSQL
 if [ "$CONFIGURE_DB" = true ]; then
-    # Install PostgreSQL if not present
     if ! command -v psql >/dev/null; then
         sudo apt update
         sudo apt -y install postgresql postgresql-contrib
         sudo systemctl enable --now postgresql
     fi
 
-    # Create database and user
     sudo -u postgres psql -tc "SELECT 1 FROM pg_database WHERE datname = '$DB_NAME'" | grep -q 1 || \
         sudo -u postgres psql -c "CREATE DATABASE $DB_NAME;"
     sudo -u postgres psql -tc "SELECT 1 FROM pg_roles WHERE rolname = '$DB_USER'" | grep -q 1 || \
@@ -57,7 +58,12 @@ if [ -f requirements.txt ]; then
 fi
 EOF
 
-# 5. Conditionally run database migrations
+# 5. Create media directory
+sudo mkdir -p "$MEDIA_ROOT"
+sudo chown "$APP_USER":www-data "$MEDIA_ROOT"
+sudo chmod 775 "$MEDIA_ROOT"
+
+# 6. Conditionally run database migrations
 if [ "$CONFIGURE_DB" = true ]; then
     sudo -u "$APP_USER" -H bash <<EOF
 cd "$PROJECT_DIR"
@@ -69,7 +75,7 @@ else
     echo "Skipping database migrations as CONFIGURE_DB=false"
 fi
 
-# 6. Create Gunicorn systemd service
+# 7. Create Gunicorn systemd service with timeout settings
 SOCKET_DIR="/run/$PROJECT_NAME"
 sudo mkdir -p "$SOCKET_DIR"
 sudo chown "$APP_USER":www-data "$SOCKET_DIR"
@@ -88,6 +94,7 @@ Environment="PATH=$PROJECT_DIR/venv/bin"
 ExecStart=$PROJECT_DIR/venv/bin/gunicorn \\
     --access-logfile - \\
     --workers 3 \\
+    --timeout $TIMEOUTS \\
     --bind unix:$SOCKET_DIR/gunicorn.sock \\
     ${PROJECT_NAME}.wsgi:application
 
@@ -98,21 +105,44 @@ EOL
 sudo systemctl daemon-reload
 sudo systemctl enable --now gunicorn
 
-# 7. Configure Nginx
+# 8. Enhanced Nginx configuration
 sudo tee /etc/nginx/sites-available/$DOMAIN > /dev/null <<EOL
+# Timeout and file size settings
+proxy_connect_timeout $TIMEOUTS;
+proxy_send_timeout $TIMEOUTS;
+proxy_read_timeout $TIMEOUTS;
+send_timeout $TIMEOUTS;
+client_max_body_size $MAX_UPLOAD_SIZE;
+
 server {
     listen 80;
     server_name $DOMAIN www.$DOMAIN;
 
-    location = /favicon.ico { access_log off; log_not_found off; }
-    
+    # Static files
     location /static/ {
         alias $PROJECT_DIR/static/;
+        expires 30d;
+        access_log off;
+    }
+    
+    # Media files (user uploaded content)
+    location /media/ {
+        alias $MEDIA_ROOT/;
+        expires 30d;
+        access_log off;
     }
 
+    # Proxy to Gunicorn
     location / {
         include proxy_params;
         proxy_pass http://unix:$SOCKET_DIR/gunicorn.sock;
+        
+        # Buffering settings for large file downloads
+        proxy_buffering on;
+        proxy_buffers 16 32k;
+        proxy_buffer_size 64k;
+        proxy_busy_buffers_size 128k;
+        proxy_max_temp_file_size 1024m;
     }
 }
 EOL
@@ -121,11 +151,19 @@ sudo rm -f /etc/nginx/sites-enabled/default
 sudo ln -sf /etc/nginx/sites-available/$DOMAIN /etc/nginx/sites-enabled/
 sudo nginx -t && sudo systemctl restart nginx
 
-# 8. SSL with Certbot (if domain is configured)
+# 9. SSL with Certbot (if domain is configured)
 if [ "$DOMAIN" != "example.com" ]; then
     sudo apt update
     sudo apt install -y certbot python3-certbot-nginx
     sudo certbot --nginx -d $DOMAIN -d www.$DOMAIN --non-interactive --agree-tos -m admin@$DOMAIN
+    
+    # Add SSL-specific timeouts to Certbot config
+    sudo sed -i "/server_name/a \    proxy_connect_timeout $TIMEOUTS;\n    proxy_send_timeout $TIMEOUTS;\n    proxy_read_timeout $TIMEOUTS;\n    send_timeout $TIMEOUTS;\n    client_max_body_size $MAX_UPLOAD_SIZE;" /etc/nginx/sites-available/$DOMAIN
+    sudo systemctl reload nginx
 fi
 
-echo "Deployment complete. Access your site at: http://$DOMAIN"
+echo "Deployment complete!"
+echo "Access your site at: http://$DOMAIN"
+echo "Media directory: $MEDIA_ROOT"
+echo "Configured timeouts: ${TIMEOUTS}s"
+echo "Max upload size: $MAX_UPLOAD_SIZE"
